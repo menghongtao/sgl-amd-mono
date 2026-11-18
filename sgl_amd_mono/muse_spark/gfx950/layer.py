@@ -196,6 +196,7 @@ def kattn_context(
         **attention.lds_views(*_attn_views(lds)),
         "put": mb.put,
         "poll": mb.poll,
+        "tag": tag,
         "args": args,
         "trace_on": key.trace,
         "layer": layer,
@@ -458,7 +459,7 @@ def build_layer(key: LayerBuild):
             ca = kattn_context(
                 ka_key, lds, a_args, scratch_a, tag, ka_layout, layer=layer
             )
-            attention.run_kattn(ca, o_flag=oflag)
+            attention.run_kattn(ca, o_flag=oflag, og=c2["og"])
             gpu.barrier()  # this CTA is done with the attention's LDS
             post_attn.run_k2(
                 c2, route_flag=rflag, xin_flag=xinflag, o_flag=oflag, QL=QL

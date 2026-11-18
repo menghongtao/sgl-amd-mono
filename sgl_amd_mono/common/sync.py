@@ -233,7 +233,9 @@ class Mailbox:
         _, pending, unpack = self._batch(specs)
 
         def load(prev):
-            words, e = [], 0
+            # every spec's load issued before any select: the selects into the loop's
+            # registers otherwise each waited for their load (a round trip a spec)
+            ws, dones, e = [], [], 0
             for b, (_, i, n) in zip(bases, specs):
                 off = fx.Int32(i) * 2
                 if const_expr(prev is not None):
@@ -241,20 +243,28 @@ class Mailbox:
                     for q in range_constexpr(1, n):
                         done = done & (prev[e + 2 * q + 1] == tag)
                     off = done.select(fx.Int32(MASK_OOB // 4), off)
-                w = fx.Vector(
-                    bo.buffer_load(
-                        rsrc(b, MASK_OOB),
-                        off,
-                        vec_width=2 * n,
-                        dtype=T.i32,
-                        cache_modifier=cm,
+                    dones.append(done)
+                ws.append(
+                    fx.Vector(
+                        bo.buffer_load(
+                            rsrc(b, MASK_OOB),
+                            off,
+                            vec_width=2 * n,
+                            dtype=T.i32,
+                            cache_modifier=cm,
+                        )
                     )
                 )
+                e += 2 * n
+            if const_expr(prev is not None):
+                rocdl.sched_barrier(0)
+            words, e = [], 0
+            for k, (_, _, n) in enumerate(specs):
                 for q in range_constexpr(2 * n):
                     if const_expr(prev is None):
-                        words.append(w[q])
+                        words.append(ws[k][q])
                     else:
-                        words.append(done.select(prev[e + q], w[q]))
+                        words.append(dones[k].select(prev[e + q], ws[k][q]))
                 e += 2 * n
             return fx.Vector.from_elements(words, fx.Int32)
 

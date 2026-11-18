@@ -1360,6 +1360,7 @@ def stage_ug(c, n_tiles, xin_wait=None, first=None):
     elif const_expr(early_w):
         cur = ug_first_loads(c, q0, dq0, n_tiles, use_dn0, c["wave"] != POLL_WAVE)
     if const_expr(xin_wait is not None):
+        rocdl.sched_barrier(0)  # (the first pair's loads stay ahead of the wait)
         xin_wait(dma)
         stamp(c, 14)  # the expert input arrived
     if const_expr(not dma):
@@ -1424,7 +1425,9 @@ def stage_ug_dyn(c, n_tiles, xin_wait=None):
     (a fixed range left the CTAs ~11 us apart at S = 16). A ticket goes out at an
     item's head, before its up pair's weights (it returns ahead of them), and
     reaches the CTA through LDS (``misc``, a slot an item parity) behind the
-    item's barrier. Returns the dn stage's first item's weights, in flight."""
+    item's barrier. The first item's gate pair goes out before the expert input's
+    wait (``xin_wait``: the plan ran on the routing alone), so its weights stream
+    while xn finishes. Returns the dn stage's first item's weights, in flight."""
     S, bid, red, tid, misc = c["S"], c["bid"], c["red"], c["tid"], c["misc"]
     UGT, DNT = c["ug_t"], c["dn_t"]
     TU = n_tiles * UGT
@@ -1432,17 +1435,20 @@ def stage_ug_dyn(c, n_tiles, xin_wait=None):
     dq0 = (bid * TD) // BLOCKS
     ctr = c["ugq"].value
     no = fx.Int32(0) == fx.Int32(1)
-    if const_expr(xin_wait is not None):
-        xin_wait()  # (before the first ticket: the queue word is zeroed before the flags)
-        stamp(c, 14)  # the expert input arrived
-    xv = xq_all_loads(c)
-    tk = fx.Int32(0)
-    if tid == 0:
-        tk = global_atomic(ctr, 1)  # the second item's
     q = bid
     cur = ug_or_dn_pair_loads(
         c, q, 0, dq0, n_tiles, q >= TU
     )  # (a CTA without an item: dn's first)
+    rocdl.sched_barrier(0)  # (the first pair's loads stay ahead of the wait)
+    if const_expr(xin_wait is not None):
+        xin_wait()
+        stamp(c, 14)  # the expert input arrived
+    tk = fx.Int32(0)
+    if tid == 0:
+        # the second item's (after the expert input's wait: the queue word is zeroed
+        # before the flags)
+        tk = global_atomic(ctr, 1)
+    xv = xq_all_loads(c)
     stage_xq_all(c, xv)
     if tid == 0:
         fx.ptr_store(tk.bitcast(fx.Float32), misc + 2)

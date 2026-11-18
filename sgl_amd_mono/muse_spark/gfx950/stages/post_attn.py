@@ -114,6 +114,7 @@ from sgl_amd_mono.muse_spark.gfx950.layout import (
     scratch_bytes,
     token_tiles,
 )
+from sgl_amd_mono.muse_spark.gfx950.stages.attention import OG_TAGGED_MAX
 
 # ---------------------------------------------------------------- K2 geometry (for layout.py)
 O_TASKS = HIDDEN // ROWS  # 512 o_proj row groups
@@ -605,9 +606,11 @@ def stage_og_rows(c, o_flag=None, QL=8, g_pre=None, swz=False):
     rounding; thread tid holds head (tid / 16) % 16, dims 4 (tid % 16) .. of
     token 2 round + tid / 256): the o tasks' B rows. It used to be an og task a
     token and a mailbox hop. ``o_flag`` (a merged launch): the requests' (KV head,
-    row tile) flags first, then device-scope loads. ``g_pre`` (``og_gate_pre``): the
-    gate words, issued before the o weights: the sigmoids (most of the work) are
-    computed before the flags' wait."""
+    row tile) flags first, then device-scope loads; at S <= ``OG_TAGGED_MAX`` the
+    flags are a hint and the o words are polled as the merge's tagged pairs
+    (``og_round_poll``). ``g_pre`` (``og_gate_pre``): the gate words, issued before
+    the o weights: the sigmoids (most of the work) are computed before the flags'
+    wait."""
     S, tid, lane, xs = c["S"], c["tid"], c["lane"], c["xs"]
     TPR = THREADS // OG_THREADS  # tokens a round: 2
     NR = -(-S // TPR)  # rounds
@@ -625,18 +628,29 @@ def stage_og_rows(c, o_flag=None, QL=8, g_pre=None, swz=False):
             )
         sig_pre = True
     o_cm = 0  # o from memory the host wrote: the default cache policy
+    # (``attention.run_kattn``'s ``og``) the merge's o rows as tagged pairs: polled
+    # straight after the flags (raised as the rows are stored), no acquire and no
+    # second round trip for the o words
+    tagged = o_flag is not None and S <= OG_TAGGED_MAX
+    assert not tagged or sig_pre is not None  # (one og batch: ``og_gate_pre``)
     if const_expr(o_flag is not None):
         o_cm = CM_DEV  # the attention's device-scope stores, earlier in this launch
         rocdl.sched_barrier(0)
         RT = (QL * GQA + 15) // 16  # the attention's row tiles a (request, KV head)
         poll_flags(c, [(o_flag, (S // QL) * LOCAL_KV_HEADS * RT)])
-        acquire_loads()
+        if const_expr(not tagged):
+            acquire_loads()
+    if const_expr(tagged):
+        rocdl.sched_barrier(0)
     # every round's o (and gate) words in flight at once (OG_BATCH rounds a batch), not
     # one round trip a round (the LDS stores between rounds kept each round's loads
     # after them)
     for b in range_constexpr(-(-NR // OG_BATCH)):
         r0, r1 = b * OG_BATCH, min(NR, (b + 1) * OG_BATCH)
-        batch = og_round_loads(c, r0, r1, e, o_cm, gate=sig_pre is None)
+        if const_expr(tagged):
+            batch = og_round_poll(c, r0, r1, e, OG_POLL_GAP)
+        else:
+            batch = og_round_loads(c, r0, r1, e, o_cm, gate=sig_pre is None)
         rocdl.sched_barrier(0)  # the batch's loads issued together, not one at each use
         for k in range_constexpr(len(batch)):
             t0, t, ow, gw = batch[k]
@@ -713,6 +727,67 @@ def og_round_loads(c, r0, r1, e, o_cm, gate=True):
             for ptr, cm in srcs
         ]
         out.append((t0, t, words[0], words[1] if gate else None))
+    return out
+
+
+OG_POLL_GAP = 2  # (``og_round_poll``) s_sleep between the tagged rows' re-polls
+
+
+def og_round_poll(c, r0, r1, e, gap=1):
+    """``og_round_loads``' o words of og rounds ``r0`` .. ``r1`` from the merge's tagged
+    pairs (``k2_og``: o element i's pair word at dword i, the tag after it), polled
+    device-scope until every pair carries this launch's tag, re-polling only the
+    rounds still pending: [(t0, t, o words, None)]."""
+    S, tid, tag = c["S"], c["tid"], c["tag"]
+    TPR = THREADS // OG_THREADS
+    r = rsrc(c["og"].value, MASK_OOB)
+    OOB = fx.Int32(MASK_OOB // 4)
+    rounds = list(range(r0, r1))
+    offs = [fx.min(rr * TPR + tid // OG_THREADS, S - 1) * Q_K + e for rr in rounds]
+
+    def done(v, k):
+        return (v[4 * k + 1] == tag) & (v[4 * k + 3] == tag)
+
+    def load(prev):
+        # every round's load issued before any select (the selects into the loop's
+        # registers otherwise each waited for their load: a round trip a round)
+        ws, dks = [], []
+        for k in range_constexpr(len(rounds)):
+            off = offs[k]
+            if const_expr(prev is not None):
+                dk = done(prev, k)
+                off = dk.select(OOB, off)
+                dks.append(dk)
+            ws.append(
+                fx.Vector(
+                    bo.buffer_load(
+                        r, off, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+                    )
+                )
+            )
+        rocdl.sched_barrier(0)
+        words = []
+        for k in range_constexpr(len(rounds)):
+            for q in range_constexpr(4):
+                w = fx.Int32(ws[k][q])
+                words.append(w if prev is None else dks[k].select(prev[4 * k + q], w))
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        bad = ~done(v, 0)
+        for k in range_constexpr(1, len(rounds)):
+            bad = bad | ~done(v, k)
+        return bad
+
+    v = _spin_masked(load, pending, gap)
+    out = []
+    for k in range_constexpr(len(rounds)):
+        rr = rounds[k]
+        t0 = rr * TPR
+        t = fx.min(t0 + tid // OG_THREADS, S - 1)
+        out.append(
+            (t0, t, fx.Vector.from_elements([v[4 * k], v[4 * k + 2]], fx.Int32), None)
+        )
     return out
 
 
@@ -1036,6 +1111,28 @@ def run_o(c, o_flag, QL):
             )
 
 
+def rs_partial_sums(c, ws, NP, PW):
+    """The all-reduced o values of ``NP`` column pairs from the W ranks' polled partial
+    pairs ``ws`` (spec (j / PW) W + src: rank src's pairs PW (j / PW) ..): each pair
+    summed in rank order in fp32 from rank 0's, one bf16 rounding -- the one-shot
+    push's sums, bit for bit. The reduce-scatter owner forms them here (its o reduce
+    and the boundary statistics) and all-gathers them; 2 NP values (f32 of bf16)."""
+    W = c["W"]
+    A_PARTS = a_parts(c["S"])
+    v = []
+    for j in range_constexpr(NP):
+        acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
+        for src in range_constexpr(1, W):
+            lo, hi = bf2_f32(ws[(j // PW) * W + src][j % PW])
+            acc0 = acc0 + lo
+            acc1 = acc1 + hi
+        v += [bf16_round(acc0), bf16_round(acc1)]
+    if const_expr(A_PARTS > 1):
+        # (a token's boundary in several parts) the pairs lie in one part's columns
+        assert 2 * NP <= HIDDEN // A_PARTS
+    return v
+
+
 @flyc.jit
 def stage_o_reduce(c, j):
     """The owner's reduce of its o task ``j`` (0 .. RS_TASKS; o task 64 rank + j: 16
@@ -1059,14 +1156,7 @@ def stage_o_reduce(c, j):
             batch=W,
         )
         stamp(c, 14, RED_T0)  # the ranks' partials of the reduce arrived
-        sums = []
-        for q in range_constexpr(RED_PW):
-            acc0, acc1 = bf2_f32(ws[0][q])
-            for src in range_constexpr(1, W):
-                lo, hi = bf2_f32(ws[src][q])
-                acc0 = acc0 + lo
-                acc1 = acc1 + hi
-            sums += [acc0, acc1]
+        sums = rs_partial_sums(c, ws, RED_PW, RED_PW)  # (bf16 values: pushed as bf16)
         for k in range_constexpr(W):
             dst = preg(pick_base(c, (rank + 1 + k) % W), c["sy_attn"], "attn")
             if const_expr(ob(c)):
@@ -1088,17 +1178,9 @@ def ob_sums(c, NC, ws):
     """The o sums of ``NC`` columns from the 8 ranks' polled partial pairs ``ws``, in rank
     order in fp32 from rank 0's: (fp32 sums, their bf16 values as f32) -- the
     all-gather's sums and the boundary's ``o_sum`` of them, bit for bit."""
-    sums, v = [], []
-    for k in range_constexpr(NC // 2):
-        acc0, acc1 = bf2_f32(ws[0][k])
-        for src in range_constexpr(1, c["W"]):
-            lo, hi = bf2_f32(ws[src][k])
-            acc0 = acc0 + lo
-            acc1 = acc1 + hi
-        sums += [acc0, acc1]
-        lo, hi = bf2_f32(bf16_pair(acc0, acc1).bitcast(fx.Int32))
-        v += [lo, hi]
-    return sums, v
+    # (the bf16 values push as the same bf16 pairs as the fp32 sums: one rounding)
+    v = rs_partial_sums(c, ws, NC // 2, NC // 2)
+    return v, v
 
 
 @flyc.jit
@@ -1299,21 +1381,29 @@ def x_poll_ob(c, v_offs, gap=1, pre=None):
         return d
 
     def load(prev):
-        words = []
+        # every load issued before any select: the selects into the loop's registers
+        # otherwise each waited for their load (a round trip a spec)
+        ws, ds = [], []
         for e in range_constexpr(N):
             off = fx.Int32(v_offs[e])
             if const_expr(prev is not None):
                 d = v_done(prev, e)
                 off = d.select(OOB, off)
-            w = fx.Vector(
-                bo.buffer_load(r, off, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)
-            )
-            for q in range_constexpr(4):
-                words.append(
-                    fx.Int32(w[q])
-                    if prev is None
-                    else d.select(prev[4 * e + q], fx.Int32(w[q]))
+                ds.append(d)
+            ws.append(
+                fx.Vector(
+                    bo.buffer_load(
+                        r, off, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+                    )
                 )
+            )
+        if const_expr(prev is not None):
+            rocdl.sched_barrier(0)
+        words = []
+        for e in range_constexpr(N):
+            for q in range_constexpr(4):
+                w = fx.Int32(ws[e][q])
+                words.append(w if prev is None else ds[e].select(prev[4 * e + q], w))
         return fx.Vector.from_elements(words, fx.Int32)
 
     def pending(v):
@@ -1399,14 +1489,7 @@ def o_sum(c, t, e0, PAIRS):
         ],
         batch=max(8, (PAIRS // PW) * W),
     )
-    for j in range_constexpr(PAIRS):
-        acc0, acc1 = bf2_f32(ws[(j // PW) * W][j % PW])
-        for src in range_constexpr(1, W):
-            lo, hi = bf2_f32(ws[(j // PW) * W + src][j % PW])
-            acc0 = acc0 + lo
-            acc1 = acc1 + hi
-        v += [bf16_round(acc0), bf16_round(acc1)]
-    return v
+    return rs_partial_sums(c, ws, PAIRS, PW)
 
 
 def keep_sums(s: int) -> bool:

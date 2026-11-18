@@ -36,7 +36,9 @@ partitions, partition lane pl folds pl, pl + 4, .. and the four lanes (a quad,
 DPP broadcasts) fold in lane order; with more, ``MERGE_GROUPS`` contiguous groups
 fold that way (a group a wave, the four lane states in each thread), the group
 records meet in LDS and fold as the old level-2 job did. The merge jobs sit on
-the last CTAs (the task loop's extra tasks fall on the first).
+the last CTAs (the task loop's extra tasks fall on the first). In a merged launch
+of at most ``OG_TAGGED_MAX`` rows a job also pushes its o rows to K2 as tagged
+pairs, which K2 polls directly (``og``).
 """
 
 import flydsl.compiler as flyc
@@ -76,24 +78,19 @@ from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_MAX_PARTS as MAX_PARTS
 from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_MERGE_GROUPS as GROUPS
 from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_PART_ROW as PART_ROW
 from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_Q_PITCH as Q_PITCH
-from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_RING_DEPTH as RING_DEPTH
 from sgl_amd_mono.muse_spark.gfx950.layout import ATTN_V_STEPS as V_STEPS
-from sgl_amd_mono.muse_spark.gfx950.layout import (
-    GQA,
-)
+from sgl_amd_mono.muse_spark.gfx950.layout import GQA
+from sgl_amd_mono.muse_spark.gfx950.layout import KATTN_RING_DEPTH as RING_DEPTH
 
 TILE = 16  # keys an MFMA tile
 NEG = -1.0e30  # a masked score, and "no key yet" of a row's running max
 NO_MAX = -1.0e29  # a running max below this is "no key yet": exp2 then takes 0
 O_OFF = 4  # a partial row: m, l, pad, pad, O[64] (O 16 B aligned)
 COMB_ROW = PART_ROW  # a tile row's (m, l, pad, pad, O[64]) in the LDS tree
-# the ring's wait at a chunk's head: chunk cc + 1's four DMAs may stay in flight
-# (SGLANG_AMD_MONO_ATTN_RING_WAIT0=1: wait for both chunks, a diagnostic)
-import os as _os
-
 SPEC_R = 2  # speculative page ids for R <= this
 SPEC_CHUNKS = 64  # chunks a wave's speculative ids cover (a lane each)
-RING_WAIT = 0 if _os.environ.get("SGLANG_AMD_MONO_ATTN_RING_WAIT0", "0") == "1" else 4
+REG_CHUNKS = 64  # a task of at most this many chunks loads its page ids to registers
+OG_TAGGED_MAX = 16  # widths whose merge pushes its o rows to K2 as tagged pairs
 MERGE_LANES = 4  # partitions folded side by side a (row, 8 dims): 16 x 8 x 4 = THREADS
 PAGE_WORDS = (
     16 * HEAD_DIM // 4
@@ -151,10 +148,13 @@ def lds_views(loop, tree):
 
 
 @flyc.jit
-def run_kattn(c, o_flag=None):
+def run_kattn(c, o_flag=None, og=None):
     """K-attn's work on this CTA for ``c["S"]`` rows, ``c["QL"]`` a request.
     ``o_flag`` (a mailbox region): each level-2 merge raises its (request, KV
-    head, row tile)'s flag once its o rows are out (a launch that goes on to K2)."""
+    head, row tile)'s flag once its o rows are out (a launch that goes on to K2).
+    ``og`` (K2's ``k2_og`` region, S <= OG_TAGGED_MAX): the merge also pushes its o
+    rows there as tagged pairs, and its flag goes up as they are stored, a hint
+    (``post_attn.og_round_poll`` polls the rows themselves)."""
     S, QL = c["S"], c["QL"]
     tid, bid, lane, wave = c["tid"], c["bid"], c["lane"], c["wave"]
     put, poll = c["put"], c["poll"]
@@ -370,13 +370,14 @@ def run_kattn(c, o_flag=None):
         # The chunk loop: a wave's 32 keys of a chunk are two K pages and two V pages
         # (1 KB each, one head), landed in LDS by DMA (16 B a lane; chunk-major: dims
         # 16 c .. of key k at bytes 256 c + 16 k, conflict-free for both the K reads
-        # and the transposed V reads) in the wave's ring slot; two chunks are in
-        # flight while one computes. (A VGPR-destination software pipeline was
+        # and the transposed V reads) in the wave's ring slot; RING_DEPTH - 1 chunks
+        # are in flight while one computes. (A VGPR-destination software pipeline was
         # drained by the compiler at every loop head: 6 us a chunk at 300k keys.)
         # The page ids of a block of IDS_CHUNKS chunks are staged in LDS first (a
         # CTA's first task within the first SPEC_CHUNKS chunks takes them from the
-        # speculative registers loaded at entry instead).
-        assert KEY_TILES == 2 and V_STEPS == 1
+        # speculative registers loaded at entry instead, and a task of at most
+        # REG_CHUNKS chunks from its own registers).
+        assert KEY_TILES == 2 and V_STEPS == 1 and RING_DEPTH == 3  # (the ring waits)
         c_last = fx.max(c_hi - 1, c_lo)
         l16d, c16d = (
             lane % 16,
@@ -395,6 +396,24 @@ def run_kattn(c, o_flag=None):
         else:
             use_spec = job < 0
             stage_ids = job >= 0
+        # the task's own page ids when the speculative ones do not serve it and its
+        # chunks fit a wave's lanes: lane cc holds this wave's two ids of chunk
+        # c_lo + cc (one dependent load a wave instead of the LDS staging and its
+        # two barriers)
+        use_reg = stage_ids & (c_hi - c_lo <= REG_CHUNKS)
+        stage_ids = stage_ids & (c_hi - c_lo > REG_CHUNKS)
+        cc_r = fx.min(c_lo + lane, c_last)
+        rgv = [
+            fx.Int32(
+                bo.buffer_load(
+                    r_pt,
+                    r * table_stride + cc_r * 16 + 2 * ks + kt,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            for kt in range(KEY_TILES)
+        ]
 
         def issue(cc, sl, b_lo):
             """Chunk cc's four pages -> ring slot sl (four loads)."""
@@ -407,11 +426,18 @@ def run_kattn(c, o_flag=None):
                         sv = (r == rr).select(spv[rr][kt], sv)
                     pg_s = read_lane_i32(sv, fx.min(cc, fx.Int32(SPEC_CHUNKS - 1)))
                     pg = use_spec.select(pg_s, pg)
-                voff = ((pg * 16 + l16d) * LOCAL_KV_HEADS + h) * HEAD_DIM + c16d * 16
-                lds_dma_16(r_k, slot + kt * PAGE_WORDS, voff)
-                lds_dma_16(
-                    r_v, slot + ((KEY_TILES + kt) * PAGE_WORDS + kt * V_SKEW), voff
-                )
+                # (the register ids' wait only on the path that reads them)
+                if use_reg:
+                    pg_r = read_lane_i32(rgv[kt], fx.min(cc - b_lo, fx.Int32(63)))
+                    dma_pages(slot, kt, pg_r)
+                else:
+                    dma_pages(slot, kt, pg)
+
+        def dma_pages(slot, kt, pg):
+            """Page ``pg``'s K and V of key tile kt -> ring slot ``slot`` (two DMAs)."""
+            voff = ((pg * 16 + l16d) * LOCAL_KV_HEADS + h) * HEAD_DIM + c16d * 16
+            lds_dma_16(r_k, slot + kt * PAGE_WORDS, voff)
+            lds_dma_16(r_v, slot + ((KEY_TILES + kt) * PAGE_WORDS + kt * V_SKEW), voff)
 
         def quad_max(v):
             """The max over the four lanes sharing a row (l16, l16 + 16, + 32, + 48)."""
@@ -447,10 +473,11 @@ def run_kattn(c, o_flag=None):
         def issue_head(b_lo, b_last):
             # only real chunks are loaded (no repeated tail loads to wait for)
             issue(b_lo, 0, b_lo)
-            if b_lo < b_last:
-                issue(b_lo + 1, 1, b_lo)
+            for k in range_constexpr(1, RING_DEPTH):
+                if b_lo + k <= b_last:
+                    issue(b_lo + k, k, b_lo)
 
-        # the first block's ids and first two chunks before the block loop: the
+        # the first block's ids and first chunks before the block loop: the
         # loop's set-up (its accumulators' zeros, ...) follows the DMAs instead of
         # preceding them
         if n_blk > 0:
@@ -487,12 +514,15 @@ def run_kattn(c, o_flag=None):
                 for it in range(NT)
             ]
             for cc in range(b_lo, b_hi):
-                sl = umod(cc - b_lo, 2)
+                sl = umod(cc - b_lo, RING_DEPTH)
                 slot = wring + sl * SLOT_WORDS
                 key0 = cc * CHUNK + ks * KEYS_PER_WAVE
-                # chunk cc's pages landed (cc + 1's in flight, when there is one)
-                if cc < b_last:
-                    rocdl.s_waitcnt(vmcnt=RING_WAIT)
+                # chunk cc's pages landed (the later chunks' four DMAs each in flight,
+                # when there are any)
+                if cc + 2 <= b_last:
+                    rocdl.s_waitcnt(vmcnt=8)
+                elif cc < b_last:
+                    rocdl.s_waitcnt(vmcnt=4)
                 else:
                     rocdl.s_waitcnt(vmcnt=0)
                 # the chunk's K operands (tile kt, step: key l16, dims 32 step + 8 g4)
@@ -610,8 +640,9 @@ def run_kattn(c, o_flag=None):
                 rocdl.s_waitcnt(lgkmcnt=0)  # every read of the slot is done
                 if cc == b_lo:
                     stamp(c, 4)  # the first chunk done
-                if cc + 2 <= b_last:
-                    issue(cc + 2, sl, b_lo)  # chunk cc + 2 into this slot
+                if cc + RING_DEPTH <= b_last:
+                    # chunk cc + RING_DEPTH into this slot
+                    issue(cc + RING_DEPTH, sl, b_lo)
             rocdl.s_waitcnt(
                 vmcnt=0
             )  # (nothing in flight: the block's last chunk waited)
@@ -697,25 +728,26 @@ def run_kattn(c, o_flag=None):
             base = (r == rr).select(starts[rr], base)
         np_r = n_parts_sel(r)
         local = job - base
-        # a partition's TASK_TILES tasks (its row tiles' groups) sit 8 jobs apart, on
-        # CTAs of one XCD (CTAs go to the XCDs in turn): they stream the same K / V
-        # pages at about the same time, so the later reads hit that XCD's L2 (before,
-        # the tasks were np_r apart, on different XCDs, each reading the pages from
-        # HBM). Groups of 8 partitions x TASK_TILES jobs; the last np_r % 8 partitions
-        # in a tail group.
+        # a partition's tasks of both KV heads and every row tile group (GC of them)
+        # sit 8 jobs apart, on CTAs of one XCD (CTAs go to the XCDs in turn): they
+        # stream the same K / V lines at about the same time (a key's two heads share
+        # its 128 B lines), so each line comes from HBM once into that XCD's L2
+        # (before, the tasks were np_r apart, on different XCDs, each reading the pages
+        # from HBM). Groups of 8 partitions x GC jobs; the last np_r % 8 partitions in
+        # a tail group.
         # (unsigned divisions: every operand is nonnegative)
-        jq = udiv(local, TASK_TILES * np_r)
-        j = local - jq * (TASK_TILES * np_r)
-        h = umod(jq, LOCAL_KV_HEADS)
+        GC = LOCAL_KV_HEADS * TASK_TILES
         full = udiv(np_r, 8) * 8
-        g, w = udiv(j, 8 * TASK_TILES), umod(j, 8 * TASK_TILES)
-        jt = j - TASK_TILES * full
+        g, w = udiv(local, 8 * GC), umod(local, 8 * GC)
+        jt = local - GC * full
         tail = fx.max(np_r - full, fx.Int32(1))
-        in_full = j < TASK_TILES * full
+        in_full = local < GC * full
         jt_c = fx.max(jt, fx.Int32(0))  # (jt < 0 only in the unselected branch)
         jtq = udiv(jt_c, tail)
         p = in_full.select(g * 8 + umod(w, 8), full + (jt_c - jtq * tail))
-        rt0 = in_full.select(udiv(w, 8), jtq) * NT
+        combo = in_full.select(udiv(w, 8), jtq)
+        h = umod(combo, LOCAL_KV_HEADS)
+        rt0 = udiv(combo, LOCAL_KV_HEADS) * NT
         attn_task(r, h, rt0, p, job)
     stamp(c, 1)  # the attention tasks done
 
@@ -742,6 +774,27 @@ def run_kattn(c, o_flag=None):
     part_floats = R * LOCAL_KV_HEADS * MAX_PARTS * ROWS * PART_ROW
     assert R * LOCAL_KV_HEADS * DIRECT_MAX * ROW_TILES * BLK <= part_floats
     assert (DIRECT_MAX + GROUPS - 1) // GROUPS <= 2 * MERGE_LANES
+
+    # (a merged launch of S <= OG_TAGGED_MAX) the o rows also go out as tagged pairs
+    # (a bf16 pair word, the launch tag) into K2's og region, o element i's pair at
+    # dword i: K2's og rows poll the rows themselves, so no release, barrier, flag
+    # poll and o load sit between the merge's stores and the o_proj
+    og_tag = o_flag is not None and S <= OG_TAGGED_MAX
+    if const_expr(og_tag):
+        assert og is not None, "K2 polls the o rows as tagged pairs (og_round_poll)"
+        og_v, o_tag = og.value, c["tag"]
+
+    def og_put(words, at):
+        """(``og_tag``) bf16 pair words ``words`` of o elements ``at`` .. as tagged pairs."""
+        vals = []
+        for w in words:
+            vals += [fx.Int32(w), o_tag]
+        bo.buffer_store(
+            fx.Vector.from_elements(vals, fx.Int32),
+            rsrc(og_v),
+            at,
+            cache_modifier=CM_DEV,
+        )
 
     def load_rec(r_src, blk, row_c):
         """A block's (m, l) of row ``row_c`` and this thread's 2 x 4 dims of O."""
@@ -840,6 +893,15 @@ def run_kattn(c, o_flag=None):
         """The partitions of (request r, head h) for row tile rt -> its o rows."""
         np_r = n_parts_sel(r)
         poll_flags(c, [(pflag, pflag_at(r, h, rt, 0), np_r)])
+
+        def og_hint():
+            # (``og_tag``) the job's o flag as its rows are stored, a hint: K2's og rows
+            # poll the tagged rows once it is up, so their spin covers about the
+            # stores' flight only
+            if const_expr(og_tag):
+                if tid == 0:
+                    put(o_flag, (r * LOCAL_KV_HEADS + h) * ROW_TILES + rt, fx.Int32(1))
+
         r_src = rsrc(part_w.value, part_floats * 4)
         row_c = fx.min(rt * 16 + row16, ROWS - 1) - rt * 16
         m = fx.Float32(NEG)
@@ -848,23 +910,21 @@ def run_kattn(c, o_flag=None):
         o1 = fx.Vector.filled(4, 0.0, fx.Float32)
 
         def store_o(m, l, o0, o1):
+            og_hint()
             if (pl == 0) & (rt * 16 + row16 < ROWS):
                 inv = fx.Float32(1.0) / l
                 t = r * QL + (rt * 16 + row16) // GQA
                 ob = t * Q_K + (h * GQA + (rt * 16 + row16) % GQA) * HEAD_DIM + dq * 4
                 r_o = rsrc(a["o"])
-                bo.buffer_store(
-                    (o0 * inv).to(fx.BFloat16),
-                    r_o,
-                    ob + (2 * dh) * 16,
-                    cache_modifier=CM_DEV,
-                )
-                bo.buffer_store(
-                    (o1 * inv).to(fx.BFloat16),
-                    r_o,
-                    ob + (2 * dh + 1) * 16,
-                    cache_modifier=CM_DEV,
-                )
+                b0 = (o0 * inv).to(fx.BFloat16)
+                b1 = (o1 * inv).to(fx.BFloat16)
+                if const_expr(og_tag):
+                    w0 = b0.bitcast(fx.Int32)
+                    w1 = b1.bitcast(fx.Int32)
+                    og_put([w0[0], w0[1]], ob + (2 * dh) * 16)
+                    og_put([w1[0], w1[1]], ob + (2 * dh + 1) * 16)
+                bo.buffer_store(b0, r_o, ob + (2 * dh) * 16, cache_modifier=CM_DEV)
+                bo.buffer_store(b1, r_o, ob + (2 * dh + 1) * 16, cache_modifier=CM_DEV)
 
         def direct(n_k):
             return combine_lanes(
@@ -968,15 +1028,15 @@ def run_kattn(c, o_flag=None):
 
             lanes = [fold2([gs[s_], gs[s_ + MERGE_LANES]]) for s_ in range(MERGE_LANES)]
             m, l, ov = fold2(lanes)
+            og_hint()
             if rt * 16 + frow < ROWS:
                 inv = fx.Float32(1.0) / l
                 t = r * QL + (rt * 16 + frow) // GQA
-                bo.buffer_store(
-                    (ov * inv).to(fx.BFloat16),
-                    rsrc(a["o"]),
-                    t * Q_K + (h * GQA + (rt * 16 + frow) % GQA) * HEAD_DIM + fd,
-                    cache_modifier=CM_DEV,
-                )
+                bv = (ov * inv).to(fx.BFloat16)
+                o_at = t * Q_K + (h * GQA + (rt * 16 + frow) % GQA) * HEAD_DIM + fd
+                if const_expr(og_tag):
+                    og_put([bv.bitcast(fx.Int32)[0]], o_at)
+                bo.buffer_store(bv, rsrc(a["o"]), o_at, cache_modifier=CM_DEV)
 
         # (a lane's partitions past the count are no-ops of the fold: the loads a
         # count needs, the result the same bits)
@@ -992,7 +1052,7 @@ def run_kattn(c, o_flag=None):
             grouped(6)
         else:
             grouped(8)
-        if const_expr(o_flag is not None):
+        if const_expr(o_flag is not None and not og_tag):
             # the (request, head, row tile)'s o rows are out: its flag, for the og tasks
             release_stores()
             gpu.barrier()

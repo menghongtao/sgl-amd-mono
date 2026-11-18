@@ -106,7 +106,10 @@ GQA = 8  # query heads a KV head on a rank
 ATTN_CHUNK = 256  # keys a chunk of the task loop
 ATTN_MAX_PARTS = 128  # partitions a request at most (the kernel sizes ``part`` to fit)
 ATTN_RING_DEPTH = 2  # chunks of K / V a wave keeps in flight (LDS DMA, 4 KB a chunk)
-ATTN_IDS_CHUNKS = 128  # chunks whose page ids a task stages in LDS at once (2048 ids)
+# K-attn's ring: three chunks in flight (a long context's chunk loop is bound by the
+# chunk loads' latency), within the LDS with a smaller page-id block
+KATTN_RING_DEPTH = 3
+ATTN_IDS_CHUNKS = 64  # chunks whose page ids a task stages in LDS at once (1024 ids)
 ATTN_MERGE_GROUPS = (
     8  # level-1 merge jobs a (request, KV head, row tile) when it has more partitions
 )
@@ -158,7 +161,7 @@ def kattn_lds_bytes(nt: int) -> int:
     qs = nt * 16 * ATTN_Q_PITCH * 2
     red = THREADS * 10 * 4
     ring = (
-        WAVES * ATTN_RING_DEPTH * (2 * 2 * 16 * HEAD_DIM + 64)
+        WAVES * KATTN_RING_DEPTH * (2 * 2 * 16 * HEAD_DIM + 64)
     )  # (K, V) x 2 pages x 16 keys x 64 fp8 a chunk, the V skew
     ids = ATTN_IDS_CHUNKS * 16 * 4
     comb = WAVES * nt * 16 * ATTN_PART_ROW * 4
